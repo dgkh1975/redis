@@ -18,6 +18,7 @@ endif
 
 TEST_MODULES = \
     commandfilter.so \
+    basics.so \
     testrdb.so \
     fork.so \
     infotest.so \
@@ -28,6 +29,7 @@ TEST_MODULES = \
     blockonbackground.so \
     scan.so \
     datatype.so \
+    datatype2.so \
     auth.so \
     keyspace_events.so \
     blockedclient.so \
@@ -35,8 +37,9 @@ TEST_MODULES = \
     test_lazyfree.so \
     timer.so \
     defragtest.so \
+    hash.so \
     zset.so \
-    stream.so
+    stream.so \
 
 
 .PHONY: all

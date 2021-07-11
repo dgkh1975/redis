@@ -133,9 +133,9 @@ void evictionPoolAlloc(void) {
     EvictionPoolLRU = ep;
 }
 
-/* This is an helper function for performEvictions(), it is used in order
+/* This is a helper function for performEvictions(), it is used in order
  * to populate the evictionPool with a few entries every time we want to
- * expire a key. Keys with idle time smaller than one of the current
+ * expire a key. Keys with idle time bigger than one of the current
  * keys are added. Keys are always added if there are free entries.
  *
  * We insert keys on place in ascending order, so keys with the smaller
@@ -342,7 +342,7 @@ size_t freeMemoryGetNotCountedMemory(void) {
         }
     }
     if (server.aof_state != AOF_OFF) {
-        overhead += sdsalloc(server.aof_buf)+aofRewriteBufferSize();
+        overhead += sdsAllocSize(server.aof_buf)+aofRewriteBufferMemoryUsage();
     }
     return overhead;
 }
@@ -572,10 +572,10 @@ int performEvictions(void) {
                     bestdbid = pool[k].dbid;
 
                     if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        de = dictFind(server.db[pool[k].dbid].dict,
+                        de = dictFind(server.db[bestdbid].dict,
                             pool[k].key);
                     } else {
-                        de = dictFind(server.db[pool[k].dbid].expires,
+                        de = dictFind(server.db[bestdbid].expires,
                             pool[k].key);
                     }
 

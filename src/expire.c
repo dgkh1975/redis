@@ -83,9 +83,8 @@ int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
  * keys that can be removed from the keyspace.
  *
  * Every expire cycle tests multiple databases: the next call will start
- * again from the next db, with the exception of exists for time limit: in that
- * case we restart again from the last database we were processing. Anyway
- * no more than CRON_DBS_PER_CALL databases are tested at every iteration.
+ * again from the next db. No more than CRON_DBS_PER_CALL databases are
+ * tested at every iteration.
  *
  * The function can perform more or less work, depending on the "type"
  * argument. It can execute a "fast cycle" or a "slow cycle". The slow
@@ -141,7 +140,7 @@ void activeExpireCycle(int type) {
 
     /* This function has some global state in order to continue the work
      * incrementally across calls. */
-    static unsigned int current_db = 0; /* Last DB tested. */
+    static unsigned int current_db = 0; /* Next DB to test. */
     static int timelimit_exit = 0;      /* Time limit hit in previous call? */
     static long long last_fast_cycle = 0; /* When last fast cycle ran. */
 
@@ -507,10 +506,15 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
 
     if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
         return;
-
+    int negative_when = when < 0;
     if (unit == UNIT_SECONDS) when *= 1000;
     when += basetime;
-
+    if (((when < 0) && !negative_when) || ((when-basetime > 0) && negative_when)) {
+        /* EXPIRE allows negative numbers, but we can at least detect an
+         * overflow by either unit conversion or basetime addition. */
+        addReplyErrorFormat(c, "invalid expire time in %s", c->cmd->name);
+        return;
+    }
     /* No key, return zero. */
     if (lookupKeyWrite(c->db,key) == NULL) {
         addReply(c,shared.czero);
@@ -535,6 +539,10 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     } else {
         setExpire(c,c->db,key,when);
         addReply(c,shared.cone);
+        /* Propagate as PEXPIREAT millisecond-timestamp */
+        robj *when_obj = createStringObjectFromLongLong(when);
+        rewriteClientCommandVector(c, 3, shared.pexpireat, key, when_obj);
+        decrRefCount(when_obj);
         signalModifiedKey(c,c->db,key);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
         server.dirty++;
@@ -562,8 +570,8 @@ void pexpireatCommand(client *c) {
     expireGenericCommand(c,0,UNIT_MILLISECONDS);
 }
 
-/* Implements TTL and PTTL */
-void ttlGenericCommand(client *c, int output_ms) {
+/* Implements TTL, PTTL, EXPIRETIME and PEXPIRETIME */
+void ttlGenericCommand(client *c, int output_ms, int output_abs) {
     long long expire, ttl = -1;
 
     /* If the key does not exist at all, return -2 */
@@ -571,11 +579,12 @@ void ttlGenericCommand(client *c, int output_ms) {
         addReplyLongLong(c,-2);
         return;
     }
+
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
     expire = getExpire(c->db,c->argv[1]);
     if (expire != -1) {
-        ttl = expire-mstime();
+        ttl = output_abs ? expire : expire-mstime();
         if (ttl < 0) ttl = 0;
     }
     if (ttl == -1) {
@@ -587,12 +596,22 @@ void ttlGenericCommand(client *c, int output_ms) {
 
 /* TTL key */
 void ttlCommand(client *c) {
-    ttlGenericCommand(c, 0);
+    ttlGenericCommand(c, 0, 0);
 }
 
 /* PTTL key */
 void pttlCommand(client *c) {
-    ttlGenericCommand(c, 1);
+    ttlGenericCommand(c, 1, 0);
+}
+
+/* EXPIRETIME key */
+void expiretimeCommand(client *c) {
+    ttlGenericCommand(c, 0, 1);
+}
+
+/* PEXPIRETIME key */
+void pexpiretimeCommand(client *c) {
+    ttlGenericCommand(c, 1, 1);
 }
 
 /* PERSIST key */

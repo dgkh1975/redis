@@ -215,11 +215,8 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                 serverAssert(vptr != NULL);
                 update = 1;
 
-                /* Delete value */
-                zl = ziplistDelete(zl, &vptr);
-
-                /* Insert new value */
-                zl = ziplistInsert(zl, vptr, (unsigned char*)value,
+                /* Replace value */
+                zl = ziplistReplace(zl, vptr, (unsigned char*)value,
                         sdslen(value));
             }
         }
@@ -473,6 +470,9 @@ void hashTypeConvertZiplist(robj *o, int enc) {
         hi = hashTypeInitIterator(o);
         dict = dictCreate(&hashDictType, NULL);
 
+        /* Presize the dict to avoid rehashing */
+        dictExpand(dict,hashTypeLength(o));
+
         while (hashTypeNext(hi) != C_ERR) {
             sds key, value;
 
@@ -549,21 +549,21 @@ robj *hashTypeDup(robj *o) {
     return hobj;
 }
 
-/* callback for to check the ziplist doesn't have duplicate recoreds */
+/* callback for to check the ziplist doesn't have duplicate records */
 static int _hashZiplistEntryValidation(unsigned char *p, void *userdata) {
     struct {
         long count;
         dict *fields;
     } *data = userdata;
 
-    /* Odd records are field names, add to dict and check that's not a dup */
+    /* Even records are field names, add to dict and check that's not a dup */
     if (((data->count) & 1) == 0) {
         unsigned char *str;
         unsigned int slen;
         long long vll;
         if (!ziplistGet(p, &str, &slen, &vll))
             return 0;
-        sds field = str? sdsnewlen(str, slen): sdsfromlonglong(vll);;
+        sds field = str? sdsnewlen(str, slen): sdsfromlonglong(vll);
         if (dictAdd(data->fields, field, NULL) != DICT_OK) {
             /* Duplicate, return an error */
             sdsfree(field);
@@ -575,7 +575,7 @@ static int _hashZiplistEntryValidation(unsigned char *p, void *userdata) {
     return 1;
 }
 
-/* Validate the integrity of the data stracture.
+/* Validate the integrity of the data structure.
  * when `deep` is 0, only the integrity of the header is validated.
  * when `deep` is 1, we scan all the entries one by one. */
 int hashZiplistValidateIntegrity(unsigned char *zl, size_t size, int deep) {
@@ -641,11 +641,11 @@ void hashTypeRandomElement(robj *hashobj, unsigned long hashsize, ziplistEntry *
 void hsetnxCommand(client *c) {
     robj *o;
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
-    hashTypeTryConversion(o,c->argv,2,3);
 
     if (hashTypeExists(o, c->argv[2]->ptr)) {
         addReply(c, shared.czero);
     } else {
+        hashTypeTryConversion(o,c->argv,2,3);
         hashTypeSet(o,c->argv[2]->ptr,c->argv[3]->ptr,HASH_SET_COPY);
         addReply(c, shared.cone);
         signalModifiedKey(c,c->db,c->argv[1]);
@@ -759,11 +759,9 @@ void hincrbyfloatCommand(client *c) {
     /* Always replicate HINCRBYFLOAT as an HSET command with the final value
      * in order to make sure that differences in float precision or formatting
      * will not create differences in replicas or after an AOF restart. */
-    robj *aux, *newobj;
-    aux = createStringObject("HSET",4);
+    robj *newobj;
     newobj = createRawStringObject(buf,len);
-    rewriteClientCommandArgument(c,0,aux);
-    decrRefCount(aux);
+    rewriteClientCommandArgument(c,0,shared.hset);
     rewriteClientCommandArgument(c,3,newobj);
     decrRefCount(newobj);
 }
@@ -959,6 +957,23 @@ void hscanCommand(client *c) {
     scanGenericCommand(c,o,cursor);
 }
 
+static void harndfieldReplyWithZiplist(client *c, unsigned int count, ziplistEntry *keys, ziplistEntry *vals) {
+    for (unsigned long i = 0; i < count; i++) {
+        if (vals && c->resp > 2)
+            addReplyArrayLen(c,2);
+        if (keys[i].sval)
+            addReplyBulkCBuffer(c, keys[i].sval, keys[i].slen);
+        else
+            addReplyBulkLongLong(c, keys[i].lval);
+        if (vals) {
+            if (vals[i].sval)
+                addReplyBulkCBuffer(c, vals[i].sval, vals[i].slen);
+            else
+                addReplyBulkLongLong(c, vals[i].lval);
+        }
+    }
+}
+
 /* How many times bigger should be the hash compared to the requested size
  * for us to not use the "remove elements" strategy? Read later in the
  * implementation for more info. */
@@ -974,7 +989,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
     int uniq = 1;
     robj *hash;
 
-    if ((hash = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]))
+    if ((hash = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray))
         == NULL || checkType(c,hash,OBJ_HASH)) return;
     size = hashTypeLength(hash);
 
@@ -1024,20 +1039,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
                 sample_count = count > limit ? limit : count;
                 count -= sample_count;
                 ziplistRandomPairs(hash->ptr, sample_count, keys, vals);
-                for (unsigned long i = 0; i < sample_count; i++) {
-                    if (withvalues && c->resp > 2)
-                        addReplyArrayLen(c,2);
-                    if (keys[i].sval)
-                        addReplyBulkCBuffer(c, keys[i].sval, keys[i].slen);
-                    else
-                        addReplyBulkLongLong(c, keys[i].lval);
-                    if (withvalues) {
-                        if (vals[i].sval)
-                            addReplyBulkCBuffer(c, vals[i].sval, vals[i].slen);
-                        else
-                            addReplyBulkLongLong(c, vals[i].lval);
-                    }
-                }
+                harndfieldReplyWithZiplist(c, sample_count, keys, vals);
             }
             zfree(keys);
             zfree(vals);
@@ -1079,6 +1081,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
      * used into CASE 4 is highly inefficient. */
     if (count*HRANDFIELD_SUB_STRATEGY_MUL > size) {
         dict *d = dictCreate(&sdsReplyDictType, NULL);
+        dictExpand(d, size);
         hashTypeIterator *hi = hashTypeInitIterator(hash);
 
         /* Add all the elements into the temporary dictionary. */
@@ -1130,9 +1133,25 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
      * to the temporary hash, trying to eventually get enough unique elements
      * to reach the specified count. */
     else {
+        if (hash->encoding == OBJ_ENCODING_ZIPLIST) {
+            /* it is inefficient to repeatedly pick one random element from a
+             * ziplist. so we use this instead: */
+            ziplistEntry *keys, *vals = NULL;
+            keys = zmalloc(sizeof(ziplistEntry)*count);
+            if (withvalues)
+                vals = zmalloc(sizeof(ziplistEntry)*count);
+            serverAssert(ziplistRandomPairsUnique(hash->ptr, count, keys, vals) == count);
+            harndfieldReplyWithZiplist(c, count, keys, vals);
+            zfree(keys);
+            zfree(vals);
+            return;
+        }
+
+        /* Hashtable encoding (generic implementation) */
         unsigned long added = 0;
         ziplistEntry key, value;
         dict *d = dictCreate(&hashDictType, NULL);
+        dictExpand(d, count);
         while(added < count) {
             hashTypeRandomElement(hash, size, &key, withvalues? &value : NULL);
 
@@ -1159,7 +1178,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
     }
 }
 
-/* HRANDFIELD [<count> WITHVALUES] */
+/* HRANDFIELD key [<count> [WITHVALUES]] */
 void hrandfieldCommand(client *c) {
     long l;
     int withvalues = 0;
